@@ -1,0 +1,298 @@
+import React, { useState, useEffect } from 'react';
+import { base44 } from '@/api/base44Client';
+import { useQuery } from '@tanstack/react-query';
+import Sidebar from './components/navigation/Sidebar';
+import TopBar from './components/navigation/TopBar';
+import { useNavigate } from 'react-router-dom';
+import { createPageUrl } from '@/utils';
+import NewProjectModal from './components/project/NewProjectModal';
+import NewChatModal from './components/project/NewChatModal';
+import { logAuditEvent, AUDIT_ACTIONS } from './components/lib/auditLog';
+import { DEFAULT_INSTRUCTIONS } from './components/lib/defaultInstructions';
+
+// Pages that don't need the full layout
+const standalonePages = ['AcceptInvite'];
+
+export default function Layout({ children, currentPageName }) {
+  const navigate = useNavigate();
+  const [user, setUser] = useState(null);
+  const [orgMember, setOrgMember] = useState(null);
+  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
+  const [showNewProject, setShowNewProject] = useState(false);
+  const [showNewChat, setShowNewChat] = useState(false);
+  const [newChatProjectId, setNewChatProjectId] = useState(null);
+  const [userProjectRoles, setUserProjectRoles] = useState({});
+
+  // Load user
+  useEffect(() => {
+    const loadUser = async () => {
+      try {
+        const currentUser = await base44.auth.me();
+        setUser(currentUser);
+        
+        const memberships = await base44.entities.OrgMember.filter({ user_email: currentUser.email });
+        if (memberships.length > 0) setOrgMember(memberships[0]);
+      } catch {
+        // Not logged in
+      }
+    };
+    loadUser();
+  }, []);
+
+  // Load organization
+  const { data: organization } = useQuery({
+    queryKey: ['organization', orgMember?.org_id],
+    queryFn: async () => {
+      const orgs = await base44.entities.Organization.filter({ id: orgMember.org_id });
+      return orgs[0];
+    },
+    enabled: !!orgMember?.org_id
+  });
+
+  // Load projects
+  const { data: projects = [] } = useQuery({
+    queryKey: ['sidebarProjects', orgMember?.org_id, user?.id],
+    queryFn: async () => {
+      if (orgMember.role === 'owner' || orgMember.role === 'admin') {
+        return base44.entities.Project.filter({ org_id: orgMember.org_id, status: 'active' });
+      }
+      
+      const memberships = await base44.entities.ProjectMember.filter({ user_id: user.id });
+      const projectIds = memberships.map(m => m.project_id);
+      const allProjects = await base44.entities.Project.filter({ org_id: orgMember.org_id, status: 'active' });
+      return allProjects.filter(p => projectIds.includes(p.id));
+    },
+    enabled: !!orgMember && !!user
+  });
+
+  // Load chats for each project
+  const { data: chatsForProject = {} } = useQuery({
+    queryKey: ['sidebarChats', projects],
+    queryFn: async () => {
+      const result = {};
+      for (const project of projects) {
+        const chats = await base44.entities.Chat.filter({ 
+          project_id: project.id, 
+          status: 'active' 
+        }, '-updated_date', 10);
+        result[project.id] = chats;
+      }
+      return result;
+    },
+    enabled: projects.length > 0
+  });
+
+  // Load user's project roles
+  useEffect(() => {
+    const loadProjectRoles = async () => {
+      if (!user) return;
+      const memberships = await base44.entities.ProjectMember.filter({ user_id: user.id });
+      const roles = {};
+      memberships.forEach(m => { roles[m.project_id] = m.role; });
+      setUserProjectRoles(roles);
+    };
+    loadProjectRoles();
+  }, [user, projects]);
+
+  // Get current project/chat from URL
+  const urlParams = new URLSearchParams(window.location.search);
+  const currentProjectId = urlParams.get('id') && currentPageName === 'Project' ? urlParams.get('id') : null;
+  const currentChatId = urlParams.get('id') && currentPageName === 'Chat' ? urlParams.get('id') : null;
+
+  const handleLogout = async () => {
+    if (orgMember) {
+      await logAuditEvent({
+        orgId: orgMember.org_id,
+        actorUserId: user.id,
+        actorEmail: user.email,
+        action: AUDIT_ACTIONS.LOGOUT
+      });
+    }
+    base44.auth.logout();
+  };
+
+  const handleSearch = (query) => {
+    // Navigate to project search or current project
+    if (currentProjectId) {
+      navigate(createPageUrl(`Project?id=${currentProjectId}&tab=search&q=${encodeURIComponent(query)}`));
+    }
+  };
+
+  const handleNewProject = () => {
+    setShowNewProject(true);
+  };
+
+  const handleNewChat = (projectId) => {
+    setNewChatProjectId(projectId);
+    setShowNewChat(true);
+  };
+
+  // Check if standalone page
+  if (standalonePages.includes(currentPageName)) {
+    return <>{children}</>;
+  }
+
+  return (
+    <div 
+      className="min-h-screen bg-white text-black"
+      style={{ 
+        fontFamily: "'Helvetica Neue', 'Neue Haas Grotesk', Inter, 'SF Pro Display', system-ui, -apple-system, sans-serif"
+      }}
+    >
+      <style>{`
+        * {
+          font-weight: 300;
+        }
+        h1, h2, h3, h4, h5, h6, strong, b, .font-bold {
+          font-weight: 700;
+        }
+        .font-medium {
+          font-weight: 400;
+        }
+        .font-light {
+          font-weight: 300;
+        }
+      `}</style>
+      
+      <div className="flex h-screen">
+        {/* Desktop Sidebar */}
+        <div className="hidden lg:block">
+          <Sidebar
+            organization={organization}
+            projects={projects}
+            currentProjectId={currentProjectId}
+            currentChatId={currentChatId}
+            chatsForProject={chatsForProject}
+            onNewProject={handleNewProject}
+            onNewChat={handleNewChat}
+            userOrgRole={orgMember?.role}
+            userProjectRole={currentProjectId ? userProjectRoles[currentProjectId] : null}
+            user={user}
+            orgId={orgMember?.org_id}
+            isCollapsed={!sidebarOpen}
+            onToggleCollapse={() => setSidebarOpen(!sidebarOpen)}
+          />
+        </div>
+
+        {/* Mobile Sidebar Overlay */}
+        {mobileSidebarOpen && (
+          <div className="lg:hidden fixed inset-0 z-50">
+            <div 
+              className="absolute inset-0 bg-black/20"
+              onClick={() => setMobileSidebarOpen(false)}
+            />
+            <div className="absolute left-0 top-0 h-full">
+              <Sidebar
+                organization={organization}
+                projects={projects}
+                currentProjectId={currentProjectId}
+                currentChatId={currentChatId}
+                chatsForProject={chatsForProject}
+                onNewProject={handleNewProject}
+                onNewChat={handleNewChat}
+                userOrgRole={orgMember?.role}
+                userProjectRole={currentProjectId ? userProjectRoles[currentProjectId] : null}
+                user={user}
+                orgId={orgMember?.org_id}
+              />
+            </div>
+          </div>
+        )}
+
+        {/* Main content */}
+        <div className="flex-1 flex flex-col min-w-0">
+          <TopBar
+            user={user}
+            currentProject={currentProjectId ? projects.find(p => p.id === currentProjectId) : null}
+            onSearch={handleSearch}
+            onLogout={handleLogout}
+            onToggleSidebar={() => setMobileSidebarOpen(!mobileSidebarOpen)}
+            isSidebarOpen={mobileSidebarOpen}
+          />
+          
+          <main className="flex-1 overflow-auto">
+            {children}
+          </main>
+        </div>
+      </div>
+
+      {/* Modals */}
+      <NewProjectModal
+        isOpen={showNewProject}
+        onClose={() => setShowNewProject(false)}
+        onCreate={async (data) => {
+          const project = await base44.entities.Project.create({
+            ...data,
+            org_id: orgMember.org_id,
+            status: 'active'
+          });
+
+          await base44.entities.ProjectMember.create({
+            project_id: project.id,
+            user_id: user.id,
+            user_email: user.email,
+            role: 'project_admin'
+          });
+
+          // Create default project instructions
+          await base44.entities.ProjectInstructions.create({
+            project_id: project.id,
+            instructions: DEFAULT_INSTRUCTIONS,
+            updated_by: user.id,
+            updated_by_email: user.email
+          });
+
+          await logAuditEvent({
+            orgId: orgMember.org_id,
+            projectId: project.id,
+            actorUserId: user.id,
+            actorEmail: user.email,
+            action: AUDIT_ACTIONS.PROJECT_CREATED,
+            metadata: { project_name: project.name }
+          });
+
+          setShowNewProject(false);
+          navigate(createPageUrl(`Project?id=${project.id}`));
+        }}
+      />
+
+      <NewChatModal
+        isOpen={showNewChat}
+        onClose={() => setShowNewChat(false)}
+        onCreate={async (data) => {
+          const chat = await base44.entities.Chat.create({
+            ...data,
+            project_id: newChatProjectId,
+            participant_ids: [user.id],
+            participant_emails: [user.email],
+            message_count: 0,
+            status: 'active'
+          });
+
+          // Create default chat instructions (inherits from project by default, but entity exists for potential override)
+          await base44.entities.ChatInstructions.create({
+            chat_id: chat.id,
+            project_id: newChatProjectId,
+            instructions: DEFAULT_INSTRUCTIONS,
+            updated_by: user.id,
+            updated_by_email: user.email
+          });
+
+          await logAuditEvent({
+            orgId: orgMember.org_id,
+            projectId: newChatProjectId,
+            chatId: chat.id,
+            actorUserId: user.id,
+            actorEmail: user.email,
+            action: AUDIT_ACTIONS.CHAT_CREATED,
+            metadata: { chat_title: chat.title }
+          });
+
+          setShowNewChat(false);
+          navigate(createPageUrl(`Chat?id=${chat.id}`));
+        }}
+      />
+    </div>
+  );
+}
